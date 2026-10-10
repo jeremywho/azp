@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -7,6 +8,14 @@ config_dir = Path(os.environ["AZURE_CONFIG_DIR"])
 args = sys.argv[1:]
 behavior_path = config_dir / "fake.json"
 behavior = json.loads(behavior_path.read_text()) if behavior_path.exists() else {}
+
+commands = [["install"]] * behavior.get("reinstall", 0) + behavior.get("azp_commands", [])
+for command in commands:
+    proc = subprocess.run([sys.executable, str(Path(__file__).resolve().parent.parent / "azp.py"), *command],
+                          capture_output=True, text=True)
+    if proc.returncode:
+        print(proc.stderr, file=sys.stderr)
+        sys.exit(proc.returncode)
 
 if args[:2] == ["account", "get-access-token"]:
     subs = json.loads((config_dir / "azureProfile.json").read_text(encoding="utf-8-sig"))["subscriptions"]

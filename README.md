@@ -41,11 +41,13 @@ Manual install: `git clone https://github.com/jeremywho/azp && py -3 azp/azp.py 
 
 Limit: tenants that enforce a Conditional Access sign-in frequency or fresh MFA (`AADSTS50078`) still need `azp login <name>` on their schedule. The keepalive turns that into a toast instead of a mid-task failure.
 
-Imported directories may contain multiple identities. Status and keepalive select a subscription for each cached identity/tenant pair instead of using the default identity for every tenant. A registered tenant with no cached account is reported as needing login. A damaged profile is reported as an error while the other profiles are still checked. An empty registry is not considered healthy.
+Imported directories may contain multiple identities. Status and keepalive select a subscription for each cached identity/tenant pair instead of using the default identity for every tenant, with up to eight checks running concurrently. Registered tenant GUIDs are compared without regard to case; a GUID with no cached account is reported as needing login. Domain aliases are passed to `az login` unchanged, and health checks use the resulting cached tenant GUIDs rather than comparing a domain name to a GUID.
+
+A fresh Azure config containing only installation metadata is reported as not logged in. A damaged profile or registry entry is reported as an error while the other profiles are still checked. Recover an invalid entry with `azp remove <name>` or `azp add <name> --force`; other profiles remain usable. An empty registry is not considered healthy. When a check error and an expired login occur together, notifications include both diagnostic guidance and the affected login commands.
 
 `AZP_HOME` selects the registry and log directory (default `~/.azp`). You can also pass `azp --home <directory> <command>`. Installing keepalive records the resolved home in the task, so a session-specific environment variable is not required when it runs. The installation manages one task named `azp-keepalive`; installing again replaces that task. Failures are written to `keepalive.log`, including notification failures when the log is writable.
 
-Generated shims and PowerShell/Bash environment output escape literal paths. `azp env --shell cmd` rejects paths containing percent signs, exclamation marks, or other characters that cmd cannot safely preserve in an assignment; use `azp run` or `azp az` for those paths. The generated `.cmd` shims support percent signs and exclamation marks in paths.
+Generated shims and PowerShell/Bash environment output escape literal paths. `azp env --shell cmd` rejects paths containing percent signs, exclamation marks, or other characters that cmd cannot safely preserve in an assignment; use `azp run` or `azp az` for those paths. The generated `.cmd` shims support percent signs and exclamation marks in paths. Bash profile shims find `az` on the current PATH, so moving the Azure CLI does not require regenerating them.
 
 After upgrading, run `azp install` to regenerate existing shims, then `azp keepalive --install` to update the scheduled action. Profile registrations and Azure credential caches are kept in place.
 
