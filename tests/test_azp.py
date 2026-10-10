@@ -163,6 +163,53 @@ class AzpTest(unittest.TestCase):
         result = self.azp("login", "home", "--tenant", TENANT_A)
         self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_A])
 
+    def test_login_short_tenant_alias_keeps_last_value_winning(self):
+        self.make_profile("work", [], tenant=TENANT_C)
+        result = self.azp("login", "work", "-t", TENANT_A, "--tenant", TENANT_B)
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_B])
+        result = self.azp("login", "work", "--tenant", TENANT_B, "-t", TENANT_A)
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_A])
+
+    def test_login_rejects_empty_tenant(self):
+        self.make_profile("work", [], tenant=TENANT_C)
+        result = self.azp("login", "work", "--tenant=")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--tenant needs a tenant id or domain", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_helper_referenced_through_another_directory_is_kept(self):
+        self.make_profile("work", [])
+        self.make_profile("home", [])
+        helper = self.referenced_helper("az-work.cmd")
+        (self.shims / "az-work.cmd").write_text(f'@"C:\\helper-cache\\{helper}" %*\r\n', encoding="utf-8")
+        self.assertEqual(self.azp("remove", "home").returncode, 0)
+        self.assertIn(helper, self.helper_names())
+        self.assertFalse((self.shims / ".azp-shims" / helper).with_suffix(".orphan").exists())
+
+    def test_reusing_helper_clears_stale_orphan_marker_before_collection(self):
+        shim = self.tmp / "solo" / "az-x.cmd"
+        shim.parent.mkdir()
+        azp.write_batch_shim(shim, "echo one %*")
+        helper = azp.HELPER_REF_RE.search(shim.read_text(encoding="utf-8")).group(1)
+        marker = (shim.parent / ".azp-shims" / helper).with_suffix(".orphan")
+        marker.touch()
+        os.utime(marker, (0, 0))
+        azp.write_batch_shim(shim, "echo one %*")
+        self.assertFalse(marker.exists())
+
+    def test_shim_writers_with_different_homes_share_the_shim_lock(self):
+        self.make_profile("work", [])
+        env = dict(os.environ, AZP_SHIM_DIR=str(self.shims))
+        with patch.dict(os.environ, env):
+            with azp.shim_lock():
+                other = dict(self.env, AZP_HOME=str(self.tmp / "other-home"))
+                proc = subprocess.Popen([sys.executable, str(AZP), "install"], env=other,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+
     def helper_names(self):
         return {p.name for p in (self.shims / ".azp-shims").glob("*.cmd")}
 

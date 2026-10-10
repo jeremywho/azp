@@ -51,7 +51,7 @@ A fresh Azure config containing only installation metadata is reported as not lo
 
 Generated shims and PowerShell/Bash environment output escape literal paths. `azp env --shell cmd` rejects paths containing percent signs, exclamation marks, or other characters that cmd cannot safely preserve in an assignment; use `azp run` or `azp az` for those paths. The generated `.cmd` shims support percent signs and exclamation marks in paths. Bash profile shims find `az` on the current PATH, so moving the Azure CLI does not require regenerating them.
 
-Windows launchers keep versioned batch helpers in `.azp-shims` inside the shim directory. Updates retain older helpers so running commands can finish without reading rewritten batch code; `add`, `remove` and `install` mark helpers no shim references and delete them once they have been unreferenced for 24 hours. No launcher control commands are appended to forwarded arguments. Interrupted file writes may leave identifiable `.azp-*.tmp` files.
+Windows launchers keep versioned batch helpers in `.azp-shims` inside the shim directory. Updates retain older helpers so running commands can finish without reading rewritten batch code; `add`, `remove` and `install` mark helpers no shim references and delete them once they have been unreferenced for 7 days. No launcher control commands are appended to forwarded arguments. Interrupted file writes may leave identifiable `.azp-*.tmp` files.
 
 After upgrading, run `azp install` to regenerate existing shims, then `azp keepalive --install` to update the scheduled action. Profile registrations and Azure credential caches are kept in place.
 

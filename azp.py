@@ -18,8 +18,8 @@ from uuid import UUID
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 TASK_NAME = "azp-keepalive"
 CHECK_TIMEOUT_S = 90
-HELPER_GRACE_S = 24 * 3600
-HELPER_REF_RE = re.compile(r"\.azp-shims[\\/]([0-9a-f]{64}\.cmd)", re.IGNORECASE)
+HELPER_GRACE_S = 7 * 24 * 3600
+HELPER_REF_RE = re.compile(r"(?<![0-9a-f])([0-9a-f]{64}\.cmd)", re.IGNORECASE)
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
@@ -56,9 +56,16 @@ def save_registry(profiles):
     write_text(path, json.dumps({"profiles": profiles}, indent=2) + "\n")
 
 
-@contextmanager
 def registry_lock():
-    path = azp_home() / "profiles.lock"
+    return file_lock(azp_home() / "profiles.lock", "profile registry")
+
+
+def shim_lock():
+    return file_lock(shim_dir() / ".azp-shims.lock", "shim directory")
+
+
+@contextmanager
+def file_lock(path, what):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+b") as handle:
         if os.name == "nt":
@@ -75,7 +82,7 @@ def registry_lock():
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise AzpError("timed out waiting for the profile registry lock")
+                        raise AzpError(f"timed out waiting for the {what} lock")
                     time.sleep(0.05)
             try:
                 yield
@@ -94,7 +101,7 @@ def registry_lock():
 def registry_writer(func):
     @wraps(func)
     def locked(*args, **kwargs):
-        with registry_lock():
+        with registry_lock(), shim_lock():
             return func(*args, **kwargs)
     return locked
 
@@ -297,7 +304,8 @@ def write_batch_shim(path, command):
         write_text(helper, helper_content)
     elif helper.read_bytes() != helper_bytes:
         raise AzpError(f"batch helper contents have changed: {helper}")
-    start = "@setlocal DisableDelayedExpansion & "
+    helper.with_suffix(".orphan").unlink(missing_ok=True)
+    start ="@setlocal DisableDelayedExpansion & "
     content = start + batch_quote(str(helper.resolve())) + " %*\r\n"
     if path.exists():
         previous = path.read_bytes()
@@ -462,6 +470,8 @@ def cmd_login(args):
     prof = get_profile(load_registry(), args.name)
     Path(prof["dir"]).mkdir(parents=True, exist_ok=True)
     cmd = az_cmd() + ["login"]
+    if args.tenant is not None and not args.tenant.strip():
+        raise AzpError("--tenant needs a tenant id or domain")
     tenant = args.tenant or prof.get("tenant")
     if tenant:
         cmd += ["--tenant", tenant]
@@ -657,7 +667,7 @@ def build_parser():
     p = sub.add_parser("login", help="az login into a profile's config dir; other args go to az login")
     p.add_argument("name")
     p.add_argument("--device-code", action="store_true")
-    p.add_argument("--tenant", help="tenant to log in to instead of the registered one; it is added alongside the profile's existing tenants")
+    p.add_argument("-t", "--tenant", help="tenant to log in to instead of the registered one; it is added alongside the profile's existing tenants")
     p.set_defaults(func=cmd_login, passthrough=True)
 
     p = sub.add_parser("az", help="run az as a profile: azp az <profile> <az args...>")
