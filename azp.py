@@ -1,13 +1,19 @@
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
+from uuid import UUID
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 TASK_NAME = "azp-keepalive"
@@ -35,28 +41,81 @@ def load_registry():
     path = registry_path()
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8")).get("profiles", {})
+    data = json.loads(path.read_text(encoding="utf-8"))
+    profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict):
+        raise AzpError(f"invalid profile registry: {path}")
+    return profiles
 
 
 def save_registry(profiles):
     path = registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"profiles": profiles}, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    write_text(path, json.dumps({"profiles": profiles}, indent=2) + "\n")
+
+
+@contextmanager
+def registry_lock():
+    path = azp_home() / "profiles.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0, os.SEEK_END)
+            if not handle.tell():
+                handle.write(b"\0")
+                handle.flush()
+            deadline = time.monotonic() + 30
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise AzpError("timed out waiting for the profile registry lock")
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def registry_writer(func):
+    @wraps(func)
+    def locked(*args, **kwargs):
+        with registry_lock():
+            return func(*args, **kwargs)
+    return locked
 
 
 def get_profile(profiles, name):
     if name not in profiles:
         known = ", ".join(sorted(profiles)) or "none registered"
         raise AzpError(f"unknown profile '{name}' (known: {known})")
-    return profiles[name]
+    prof = profiles[name]
+    if (not NAME_RE.fullmatch(name) or not isinstance(prof, dict)
+            or not isinstance(prof.get("dir"), str) or not prof["dir"]
+            or ("tenant" in prof and not isinstance(prof["tenant"], str))):
+        raise AzpError(f"invalid profile '{name}'; remove it with azp remove or replace it with azp add --force")
+    return prof
 
 
 def az_cmd():
     override = os.environ.get("AZP_AZ_CMD")
     if override:
-        return json.loads(override)
+        cmd = json.loads(override)
+        if not isinstance(cmd, list) or not cmd or not all(isinstance(p, str) and p for p in cmd):
+            raise AzpError("AZP_AZ_CMD must be a nonempty JSON array of command arguments")
+        return cmd
     found = shutil.which("az")
     if not found:
         raise AzpError("az not found on PATH")
@@ -87,19 +146,21 @@ def read_subscriptions(config_dir):
     if not path.exists():
         return []
     data = json.loads(path.read_text(encoding="utf-8-sig"))
-    return data.get("subscriptions", [])
+    subs = data.get("subscriptions", []) if isinstance(data, dict) else None
+    if not isinstance(subs, list):
+        raise AzpError(f"invalid subscription data: {path}")
+    for sub in subs:
+        if (not isinstance(sub, dict)
+                or not all(isinstance(sub.get(k), str) and sub[k] for k in ("id", "name", "tenantId"))
+                or not isinstance(sub.get("user"), dict)
+                or not all(isinstance(sub["user"].get(k), str) and sub["user"][k] for k in ("name", "type"))
+                or ("environmentName" in sub and not isinstance(sub["environmentName"], str))):
+            raise AzpError(f"invalid subscription entry: {path}")
+    return subs
 
 
 def users_of(subs):
     return sorted({s.get("user", {}).get("name", "?") for s in subs})
-
-
-def tenants_of(prof, subs):
-    tenants = []
-    for tenant in [prof.get("tenant")] + [s.get("tenantId") for s in subs]:
-        if tenant and tenant not in tenants:
-            tenants.append(tenant)
-    return tenants
 
 
 def failure_reason(stderr):
@@ -112,9 +173,9 @@ def failure_reason(stderr):
     return lines[-1][:160] if lines else "unknown failure"
 
 
-def check_tenant(prof, tenant, hidden):
-    cmd = az_cmd() + ["account", "get-access-token", "--tenant", tenant, "--query", "expiresOn", "-o", "tsv"]
+def check_account(prof, subscription, hidden):
     try:
+        cmd = az_cmd() + ["account", "get-access-token", "--subscription", subscription, "--query", "expiresOn", "-o", "tsv"]
         proc = subprocess.run(
             cmd,
             env=profile_env(prof),
@@ -127,44 +188,67 @@ def check_tenant(prof, tenant, hidden):
             creationflags=CREATE_NO_WINDOW if hidden else 0,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "detail": f"timed out after {CHECK_TIMEOUT_S}s"}
+        return {"ok": False, "error": True, "detail": f"timed out after {CHECK_TIMEOUT_S}s"}
+    except (AzpError, OSError, ValueError) as exc:
+        return {"ok": False, "error": True, "detail": str(exc)}
     if proc.returncode == 0 and proc.stdout.strip():
         return {"ok": True, "detail": f"token valid until {proc.stdout.strip()[:16]}"}
     return {"ok": False, "detail": failure_reason(proc.stderr)}
 
 
 def check_all(profiles, hidden=False):
+    if not profiles:
+        return [{"profile": "(registry)", "dir": str(azp_home()), "tenant": None, "users": [],
+                 "subscriptions": [], "ok": False, "error": True, "empty_registry": True,
+                 "detail": "no profiles registered; add a profile or run azp keepalive --uninstall to stop scheduled checks"}]
+
+    rows = []
     jobs = []
-    for name, prof in sorted(profiles.items()):
-        subs = read_subscriptions(prof["dir"])
-        tenants = tenants_of(prof, subs)
+    for name in sorted(profiles):
+        base = {"profile": name, "dir": None, "tenant": None, "users": [], "subscriptions": []}
+        try:
+            prof = get_profile(profiles, name)
+            base["dir"] = prof["dir"]
+            subs = read_subscriptions(prof["dir"])
+        except (AzpError, OSError, ValueError) as exc:
+            rows.append(dict(base, ok=False, error=True, detail=str(exc)))
+            continue
         if not subs:
-            jobs.append((name, prof, None, subs))
-        for tenant in tenants if subs else []:
-            jobs.append((name, prof, tenant, subs))
+            rows.append(dict(base, ok=False, detail="not logged in"))
+            continue
+        groups = {}
+        for sub in subs:
+            key = (sub["tenantId"], sub["user"]["name"].lower(), sub["user"]["type"], sub.get("environmentName"))
+            groups.setdefault(key, []).append(sub)
+        for (tenant, _, _, _), accounts in groups.items():
+            row = dict(base, tenant=tenant, users=users_of(accounts), subscriptions=[s["name"] for s in accounts])
+            rows.append(row)
+            jobs.append((prof, accounts[0]["id"], row))
+        try:
+            registered_tenant = str(UUID(prof.get("tenant", "")))
+        except ValueError:
+            registered_tenant = None
+        if registered_tenant and not any(s["tenantId"].lower() == registered_tenant for s in subs):
+            rows.append(dict(base, tenant=registered_tenant, ok=False, detail="registered tenant has no cached account; login required"))
 
     def run(job):
-        name, prof, tenant, subs = job
-        row = {"profile": name, "dir": prof["dir"], "tenant": tenant, "users": users_of(subs)}
-        if tenant is None:
-            row.update(ok=False, detail="not logged in", subscriptions=[])
-            return row
-        row["subscriptions"] = [s.get("name") for s in subs if s.get("tenantId") == tenant]
-        row.update(check_tenant(prof, tenant, hidden))
-        return row
+        prof, subscription, row = job
+        row.update(check_account(prof, subscription, hidden))
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(run, jobs))
+        for _ in pool.map(run, jobs):
+            pass
+    return rows
 
 
 def print_rows(rows):
     for row in rows:
-        state = "ok" if row["ok"] else "LOGIN NEEDED"
+        state = "ok" if row["ok"] else "ERROR" if row.get("error") else "LOGIN NEEDED"
         print(f"{row['profile']:<10} {state:<13} {', '.join(row['users']) or '-'}")
         print(f"{'':<10} tenant {row['tenant'] or '-'}  {row['detail']}")
         if row["subscriptions"]:
             print(f"{'':<10} subs: {', '.join(row['subscriptions'])}")
-    failing = sorted({r["profile"] for r in rows if not r["ok"]})
+    failing = sorted({r["profile"] for r in rows if not r["ok"] and not r.get("error")})
     if failing:
         print()
         for name in failing:
@@ -175,28 +259,95 @@ def write_shims(profiles):
     target = shim_dir()
     target.mkdir(parents=True, exist_ok=True)
     cmd = az_cmd() if profiles else []
-    invoke = " ".join(f'"{part}"' for part in cmd)
-    installer = 'set "AZ_INSTALLER=MSI"\r\n' if uses_bundled_python(cmd) else ""
-    for name, prof in profiles.items():
+    invoke = " ".join(batch_quote(part) for part in cmd)
+    installer = 'set "AZ_INSTALLER=MSI" & ' if uses_bundled_python(cmd) else ""
+    for name in profiles:
+        try:
+            prof = get_profile(profiles, name)
+        except AzpError as exc:
+            print(f"azp: {exc}", file=sys.stderr)
+            continue
         win_dir = str(Path(prof["dir"]))
         posix_dir = win_dir.replace("\\", "/")
-        write_text(
+        write_batch_shim(
             target / f"az-{name}.cmd",
-            f'@echo off\r\nsetlocal\r\nset "AZURE_CONFIG_DIR={win_dir}"\r\n{installer}{invoke} %*\r\n',
+            f'set {batch_quote("AZURE_CONFIG_DIR=" + win_dir)} & {installer}{invoke} %*',
         )
-        write_text(target / f"az-{name}", f"#!/usr/bin/env bash\nAZURE_CONFIG_DIR='{posix_dir}' exec az \"$@\"\n")
+        write_text(target / f"az-{name}", f"#!/usr/bin/env bash\nAZURE_CONFIG_DIR={bash_quote(posix_dir)} exec az \"$@\"\n")
 
 
 def remove_shims(name):
+    if not NAME_RE.fullmatch(name):
+        return
     for suffix in (".cmd", ""):
         path = shim_dir() / f"az-{name}{suffix}"
         if path.exists():
             path.unlink()
 
 
+def write_batch_shim(path, command):
+    helper_content = "@echo off\r\nsetlocal DisableDelayedExpansion\r\n" + command + "\r\n"
+    helper_bytes = helper_content.encode("utf-8")
+    helpers = path.parent / ".azp-shims"
+    helpers.mkdir(parents=True, exist_ok=True)
+    helper = helpers / (hashlib.sha256(helper_bytes).hexdigest() + ".cmd")
+    if not helper.exists():
+        write_text(helper, helper_content)
+    elif helper.read_bytes() != helper_bytes:
+        raise AzpError(f"batch helper contents have changed: {helper}")
+    start = "@setlocal DisableDelayedExpansion & "
+    content = start + batch_quote(str(helper.resolve())) + " %*\r\n"
+    if path.exists():
+        previous = path.read_bytes()
+        jump = b"@goto azp_start\r\n"
+        label = b":azp_start\r\n"
+        if previous.startswith(jump) and label in previous:
+            content = previous[:previous.index(label) + len(label)].decode("utf-8") + content
+        elif not previous.startswith(start.encode()):
+            # Older batch callers resume reading at their original EOF after the child exits.
+            # New callers jump over that exit and transfer control to an immutable batch helper.
+            padding = max(0, len(previous) - len(jump))
+            content = jump.decode() + " " * padding + "@exit /b %errorlevel%\r\n:azp_start\r\n" + content
+        if previous == content.encode("utf-8"):
+            return
+    write_text(path, content)
+
+
 def write_text(path, content):
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(content)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=path.parent,
+                                         prefix=".azp-", suffix=".tmp", delete=False) as handle:
+            tmp = Path(handle.name)
+            handle.write(content)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def bash_quote(value):
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def powershell_quote(value):
+    for quote in "'\u2018\u2019\u201a\u201b":
+        value = value.replace(quote, quote * 2)
+    return "'" + value + "'"
+
+
+def batch_quote(value):
+    if any(c in value for c in '\"\r\n\0'):
+        raise AzpError("cannot safely represent this value in a Windows batch shim")
+    return '"' + value.replace("%", "%%") + '"'
 
 
 def launcher():
@@ -204,17 +355,25 @@ def launcher():
     return [py, "-3", "-E", "-s"] if py else [sys.executable, "-E", "-s"]
 
 
+@registry_writer
 def cmd_add(args):
-    if not NAME_RE.match(args.name):
+    if not NAME_RE.fullmatch(args.name):
         raise AzpError("profile names are lowercase letters, digits and dashes")
     profiles = load_registry()
     if args.name in profiles and not args.force:
         raise AzpError(f"profile '{args.name}' already exists (use --force to overwrite)")
     config_dir = Path(args.dir).expanduser() if args.dir else Path.home() / f".azure-{args.name}"
     config_dir = config_dir.resolve()
-    owner = next((n for n, p in profiles.items() if Path(p["dir"]).resolve() == config_dir and n != args.name), None)
-    if owner:
-        raise AzpError(f"{config_dir} already belongs to profile '{owner}'")
+    for name in profiles:
+        if name == args.name:
+            continue
+        try:
+            prof = get_profile(profiles, name)
+            owned_dir = Path(prof["dir"]).resolve()
+        except (AzpError, OSError, ValueError):
+            continue
+        if owned_dir == config_dir:
+            raise AzpError(f"{config_dir} already belongs to profile '{name}'")
     config_dir.mkdir(parents=True, exist_ok=True)
     profiles[args.name] = {"dir": str(config_dir)}
     if args.tenant:
@@ -227,13 +386,16 @@ def cmd_add(args):
     return 0
 
 
+@registry_writer
 def cmd_remove(args):
     profiles = load_registry()
-    prof = get_profile(profiles, args.name)
-    del profiles[args.name]
+    if args.name not in profiles:
+        get_profile(profiles, args.name)
+    prof = profiles.pop(args.name)
     save_registry(profiles)
     remove_shims(args.name)
-    print(f"removed '{args.name}' (config dir left in place: {prof['dir']})")
+    config_dir = prof.get("dir", "unknown") if isinstance(prof, dict) else "unknown"
+    print(f"removed '{args.name}' (config dir left in place: {config_dir})")
     return 0
 
 
@@ -242,11 +404,18 @@ def cmd_list(args):
     if args.json:
         print(json.dumps(profiles, indent=2))
         return 0
-    for name, prof in sorted(profiles.items()):
-        subs = read_subscriptions(prof["dir"])
+    failed = False
+    for name in sorted(profiles):
+        try:
+            prof = get_profile(profiles, name)
+            subs = read_subscriptions(prof["dir"])
+        except (AzpError, OSError, ValueError) as exc:
+            print(f"{name:<10} ERROR: {exc}", file=sys.stderr)
+            failed = True
+            continue
         default = next((s.get("name") for s in subs if s.get("isDefault")), "-")
         print(f"{name:<10} {', '.join(users_of(subs)) or '(not logged in)'}  default: {default}  [{prof['dir']}]")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_status(args):
@@ -287,23 +456,36 @@ def cmd_env(args):
     prof = get_profile(load_registry(), args.name)
     path = prof["dir"]
     if args.shell == "bash":
-        print(f"export AZURE_CONFIG_DIR='{path.replace(chr(92), '/')}'")
+        print(f"export AZURE_CONFIG_DIR={bash_quote(path.replace(chr(92), '/'))}")
     elif args.shell == "cmd":
+        if any(c in path for c in '%!\"\r\n\0'):
+            raise AzpError("this path cannot be safely emitted for cmd; use azp run or azp az instead")
         print(f'set "AZURE_CONFIG_DIR={path}"')
     else:
-        print(f"$env:AZURE_CONFIG_DIR = '{path}'")
+        print("$env:AZURE_CONFIG_DIR = " + powershell_quote(path))
     return 0
 
 
 def cmd_which(args):
     query = args.query.lower()
     found = 0
-    for name, prof in sorted(load_registry().items()):
-        for sub in read_subscriptions(prof["dir"]):
+    profiles = load_registry()
+    failed = False
+    for name in sorted(profiles):
+        try:
+            prof = get_profile(profiles, name)
+            subs = read_subscriptions(prof["dir"])
+        except (AzpError, OSError, ValueError) as exc:
+            print(f"{name:<10} ERROR: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        for sub in subs:
             if query == sub.get("id", "").lower() or query in sub.get("name", "").lower():
                 found += 1
                 user = sub.get("user", {}).get("name", "?")
                 print(f"{name:<10} {sub.get('name')}  {sub.get('id')}  tenant {sub.get('tenantId')}  {user}")
+    if failed:
+        return 2
     if not found:
         print(f"no registered profile has a subscription matching '{args.query}'", file=sys.stderr)
         return 1
@@ -315,21 +497,54 @@ def cmd_keepalive(args):
         return install_task(args.every_hours)
     if args.uninstall:
         return subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]).returncode
-    rows = check_all(load_registry(), hidden=args.notify)
+    try:
+        rows = check_all(load_registry(), hidden=args.notify)
+    except (AzpError, OSError, ValueError) as exc:
+        rows = [{"profile": "(registry)", "dir": str(azp_home()), "tenant": None, "users": [],
+                 "subscriptions": [], "ok": False, "error": True, "detail": str(exc)}]
     failing = sorted({r["profile"] for r in rows if not r["ok"]})
+    errors = sorted({r["profile"] for r in rows if not r["ok"] and r.get("error")})
+    logins = sorted({r["profile"] for r in rows if not r["ok"] and not r.get("error")})
     stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    summary = "all ok" if not failing else "LOGIN NEEDED: " + ", ".join(failing)
+    summary = "; ".join(label + ", ".join(names) for label, names in
+                        (("CHECK FAILED: ", errors), ("LOGIN NEEDED: ", logins)) if names) or "all ok"
     log = azp_home() / "keepalive.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "a", encoding="utf-8") as handle:
-        handle.write(f"{stamp} {summary}\n")
-        for row in rows:
-            handle.write(f"  {row['profile']} {row['tenant']} {'ok' if row['ok'] else 'FAIL'} {row['detail']}\n")
+    log_error = None
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {summary}\n")
+            for row in rows:
+                detail = " ".join(row["detail"].splitlines())
+                handle.write(f"  {row['profile']} {row['tenant']} {'ok' if row['ok'] else 'FAIL'} {detail}\n")
+    except OSError as exc:
+        log_error = str(exc)
+        print(f"azp: could not write keepalive log: {exc}", file=sys.stderr)
     if not args.notify:
         print_rows(rows)
-    elif failing:
-        toast("Azure login needed", "Run: " + "; ".join(f"azp login {n}" for n in failing))
-    return 0 if not failing else 1
+    elif failing or log_error:
+        login_help = "Run: " + "; ".join(f"azp login {n}" for n in logins) if logins else ""
+        if log_error or any(r.get("error") for r in rows):
+            title = "Azure keepalive failed"
+            body = (login_help + ". " if login_help else "") + "Run azp status and inspect " + str(log)
+        else:
+            title, body = "Azure login needed", login_help
+        if any(r.get("empty_registry") for r in rows):
+            body = "No profiles registered. Add a profile or run azp keepalive --uninstall to stop scheduled checks."
+            if log_error:
+                body += " The keepalive log could not be written."
+        try:
+            toast(title, body)
+        except (AzpError, OSError, subprocess.TimeoutExpired) as exc:
+            detail = f"notification failed: {exc}"
+            print(f"azp: {detail}", file=sys.stderr)
+            try:
+                with open(log, "a", encoding="utf-8") as handle:
+                    handle.write(f"{stamp} {detail}\n")
+            except OSError:
+                pass
+            return 1
+    return 0 if not failing and not log_error else 1
 
 
 def toast(title, body):
@@ -344,32 +559,39 @@ def toast(title, body):
     )
     env = os.environ.copy()
     env.update(AZP_TOAST_TITLE=title, AZP_TOAST_BODY=body)
-    subprocess.run(
+    proc = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
         env=env,
         capture_output=True,
         creationflags=CREATE_NO_WINDOW,
+        timeout=30,
     )
+    if proc.returncode:
+        raise AzpError(f"toast process exited with code {proc.returncode}")
 
 
 def install_task(every_hours):
+    if not 1 <= every_hours <= 23:
+        raise AzpError("--every-hours must be between 1 and 23")
     pyw = shutil.which("pyw")
     if not pyw:
         raise AzpError("pyw (Python launcher, windowless) not found on PATH")
-    action = f'"{pyw}" -3 -E -s "{Path(__file__).resolve()}" keepalive --notify'
+    action = subprocess.list2cmdline([pyw, "-3", "-E", "-s", str(Path(__file__).resolve()),
+                                    "--home", str(azp_home().expanduser().resolve()), "keepalive", "--notify"])
     cmd = ["schtasks", "/Create", "/TN", TASK_NAME, "/SC", "HOURLY", "/MO", str(every_hours), "/TR", action, "/F"]
     return subprocess.run(cmd).returncode
 
 
+@registry_writer
 def cmd_install(args):
     target = shim_dir()
     target.mkdir(parents=True, exist_ok=True)
     script = Path(__file__).resolve()
     exe, *flags = launcher()
     flags = " ".join(flags)
-    write_text(target / "azp.cmd", f'@"{exe}" {flags} "{script}" %*\r\n')
+    write_batch_shim(target / "azp.cmd", f'{batch_quote(exe)} {flags} {batch_quote(str(script))} %*')
     posix = lambda p: str(p).replace("\\", "/")
-    write_text(target / "azp", f"#!/usr/bin/env bash\nexec '{posix(exe)}' {flags} '{posix(script)}' \"$@\"\n")
+    write_text(target / "azp", f"#!/usr/bin/env bash\nexec {bash_quote(posix(exe))} {flags} {bash_quote(posix(script))} \"$@\"\n")
     write_shims(load_registry())
     print(f"shims written to {target}")
     return 0
@@ -377,6 +599,7 @@ def cmd_install(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="azp", description="Keep several Azure CLI identities logged in side by side.")
+    parser.add_argument("--home", help="profile registry and log directory (overrides AZP_HOME)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("add", help="register a profile (one isolated az config dir)")
@@ -447,8 +670,10 @@ def main(argv=None):
         if value and value[0] == "--":
             setattr(args, attr, value[1:])
     try:
+        if args.home:
+            os.environ["AZP_HOME"] = str(Path(args.home).expanduser().resolve())
         return args.func(args)
-    except AzpError as exc:
+    except (AzpError, OSError, ValueError) as exc:
         print(f"azp: {exc}", file=sys.stderr)
         return 2
 
