@@ -151,6 +151,119 @@ class AzpTest(unittest.TestCase):
         seen = json.loads(result.stdout)
         self.assertEqual(seen["args"], ["login", "--tenant", TENANT_C, "--use-device-code", "--allow-no-subscriptions"])
 
+    def test_login_tenant_flag_replaces_registered_tenant(self):
+        self.make_profile("work", [], tenant=TENANT_C)
+        result = self.azp("login", "work", "--tenant", TENANT_A, "--allow-no-subscriptions")
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_A, "--allow-no-subscriptions"])
+        result = self.azp("login", "work", f"--tenant={TENANT_B}")
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_B])
+
+    def test_login_tenant_flag_works_without_registered_tenant(self):
+        self.make_profile("home", [])
+        result = self.azp("login", "home", "--tenant", TENANT_A)
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_A])
+
+    def test_login_short_tenant_alias_keeps_last_value_winning(self):
+        self.make_profile("work", [], tenant=TENANT_C)
+        result = self.azp("login", "work", "-t", TENANT_A, "--tenant", TENANT_B)
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_B])
+        result = self.azp("login", "work", "--tenant", TENANT_B, "-t", TENANT_A)
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_A])
+
+    def test_login_rejects_empty_tenant(self):
+        self.make_profile("work", [], tenant=TENANT_C)
+        result = self.azp("login", "work", "--tenant=")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--tenant needs a tenant id or domain", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_helper_referenced_through_another_directory_is_kept(self):
+        self.make_profile("work", [])
+        self.make_profile("home", [])
+        helper = self.referenced_helper("az-work.cmd")
+        (self.shims / "az-work.cmd").write_text(f'@"C:\\helper-cache\\{helper}" %*\r\n', encoding="utf-8")
+        self.assertEqual(self.azp("remove", "home").returncode, 0)
+        self.assertIn(helper, self.helper_names())
+        self.assertFalse((self.shims / ".azp-shims" / helper).with_suffix(".orphan").exists())
+
+    def test_reusing_helper_clears_stale_orphan_marker_before_collection(self):
+        shim = self.tmp / "solo" / "az-x.cmd"
+        shim.parent.mkdir()
+        azp.write_batch_shim(shim, "echo one %*")
+        helper = azp.HELPER_REF_RE.search(shim.read_text(encoding="utf-8")).group(1)
+        marker = (shim.parent / ".azp-shims" / helper).with_suffix(".orphan")
+        marker.touch()
+        os.utime(marker, (0, 0))
+        azp.write_batch_shim(shim, "echo one %*")
+        self.assertFalse(marker.exists())
+
+    def test_shim_writers_with_different_homes_share_the_shim_lock(self):
+        self.make_profile("work", [])
+        env = dict(os.environ, AZP_SHIM_DIR=str(self.shims))
+        with patch.dict(os.environ, env):
+            with azp.shim_lock():
+                other = dict(self.env, AZP_HOME=str(self.tmp / "other-home"))
+                proc = subprocess.Popen([sys.executable, str(AZP), "install"], env=other,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+
+    def helper_names(self):
+        return {p.name for p in (self.shims / ".azp-shims").glob("*.cmd")}
+
+    def referenced_helper(self, shim):
+        return azp.HELPER_REF_RE.search((self.shims / shim).read_text(encoding="utf-8")).group(1)
+
+    def age_orphan_markers(self, seconds):
+        for marker in (self.shims / ".azp-shims").glob("*.orphan"):
+            past = marker.stat().st_mtime - seconds
+            os.utime(marker, (past, past))
+
+    def test_removed_profile_helper_is_marked_then_deleted_after_grace(self):
+        self.make_profile("home", [])
+        self.make_profile("work", [])
+        home_helper = self.referenced_helper("az-home.cmd")
+        work_helper = self.referenced_helper("az-work.cmd")
+        self.assertEqual(self.azp("remove", "work").returncode, 0)
+        helpers = self.shims / ".azp-shims"
+        self.assertIn(work_helper, self.helper_names())
+        self.assertTrue((helpers / work_helper).with_suffix(".orphan").exists())
+        self.assertFalse((helpers / home_helper).with_suffix(".orphan").exists())
+
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertIn(work_helper, self.helper_names())
+
+        self.age_orphan_markers(azp.HELPER_GRACE_S + 60)
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertNotIn(work_helper, self.helper_names())
+        self.assertFalse((helpers / work_helper).with_suffix(".orphan").exists())
+        self.assertIn(home_helper, self.helper_names())
+
+    def test_orphan_that_is_referenced_again_is_kept(self):
+        config_dir = self.make_profile("work", [])
+        helper = self.referenced_helper("az-work.cmd")
+        self.assertEqual(self.azp("remove", "work").returncode, 0)
+        self.age_orphan_markers(azp.HELPER_GRACE_S + 60)
+        self.assertEqual(self.azp("add", "work", "--dir", str(config_dir)).returncode, 0)
+        self.assertEqual(self.referenced_helper("az-work.cmd"), helper)
+        self.assertIn(helper, self.helper_names())
+        self.assertFalse((self.shims / ".azp-shims" / helper).with_suffix(".orphan").exists())
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertIn(helper, self.helper_names())
+
+    def test_retargeted_profile_old_helper_survives_grace_period(self):
+        self.make_profile("work", [])
+        old_helper = self.referenced_helper("az-work.cmd")
+        new_dir = self.tmp / "new-dir"
+        self.assertEqual(self.azp("add", "work", "--force", "--dir", str(new_dir)).returncode, 0)
+        self.assertNotEqual(self.referenced_helper("az-work.cmd"), old_helper)
+        self.assertIn(old_helper, self.helper_names())
+        self.age_orphan_markers(azp.HELPER_GRACE_S - 3600)
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertIn(old_helper, self.helper_names())
+
     def test_cmd_shim_passes_unquoted_parentheses_through(self):
         config_dir = self.make_profile("work", [])
         args = ["account", "list", "--query", "length(@)", "-o", "tsv"]
