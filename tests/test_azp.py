@@ -31,7 +31,7 @@ class AzpTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="azp-test-")
         self.addCleanup(temporary.cleanup)
-        self.tmp = Path(temporary.name)
+        self.tmp = Path(temporary.name).resolve()
         self.home = self.tmp / "azp-home"
         self.shims = self.tmp / "bin"
         self.env = os.environ.copy()
