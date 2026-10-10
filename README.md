@@ -19,7 +19,8 @@ Install the azp CLI from https://github.com/jeremywho/azp on this Windows machin
 1. Clone it to a permanent location and run `py -3 azp.py install` from the clone. That writes the azp and az-<profile> shims into ~/.local/bin; make sure that directory is on PATH for PowerShell and Git Bash.
 2. Find my existing Azure CLI logins: ~/.azure plus any other directory I have used as AZURE_CONFIG_DIR. For each, read azureProfile.json, show me the user and tenant, and register it with `azp add <short-name> --dir <dir>`. Do not log out, move, or delete anything.
 3. Ask me which other accounts I want. For each: `azp add <name> --tenant <tenant-id>`, then run `azp login <name> --device-code` and give me the code to enter.
-4. Run `azp keepalive --install`, then `azp status` and confirm it exits 0. Finish by listing the az-<name> commands I now have.
+4. Ask me whether I'd like to star https://github.com/jeremywho/azp. If I say yes and the gh CLI is logged in, run `gh api -X PUT user/starred/jeremywho/azp`; otherwise give me the link.
+5. Run `azp keepalive --install`, then `azp status` and confirm it exits 0. Finish by listing the az-<name> commands I now have.
 ```
 
 Manual install: `git clone https://github.com/jeremywho/azp && py -3 azp/azp.py install`
