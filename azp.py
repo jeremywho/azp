@@ -1,5 +1,6 @@
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -198,7 +199,8 @@ def check_account(prof, subscription, hidden):
 def check_all(profiles, hidden=False):
     if not profiles:
         return [{"profile": "(registry)", "dir": str(azp_home()), "tenant": None, "users": [],
-                 "subscriptions": [], "ok": False, "error": True, "detail": "no profiles registered"}]
+                 "subscriptions": [], "ok": False, "error": True, "empty_registry": True,
+                 "detail": "no profiles registered; add a profile or run azp keepalive --uninstall to stop scheduled checks"}]
 
     rows = []
     jobs = []
@@ -284,8 +286,17 @@ def remove_shims(name):
 
 
 def write_batch_shim(path, command):
+    helper_content = "@echo off\r\nsetlocal DisableDelayedExpansion\r\n" + command + "\r\n"
+    helper_bytes = helper_content.encode("utf-8")
+    helpers = path.parent / ".azp-shims"
+    helpers.mkdir(parents=True, exist_ok=True)
+    helper = helpers / (hashlib.sha256(helper_bytes).hexdigest() + ".cmd")
+    if not helper.exists():
+        write_text(helper, helper_content)
+    elif helper.read_bytes() != helper_bytes:
+        raise AzpError(f"batch helper contents have changed: {helper}")
     start = "@setlocal DisableDelayedExpansion & "
-    content = start + command + " & call exit /b %%errorlevel%%\r\n"
+    content = start + batch_quote(str(helper.resolve())) + " %*\r\n"
     if path.exists():
         previous = path.read_bytes()
         jump = b"@goto azp_start\r\n"
@@ -294,7 +305,7 @@ def write_batch_shim(path, command):
             content = previous[:previous.index(label) + len(label)].decode("utf-8") + content
         elif not previous.startswith(start.encode()):
             # Older batch callers resume reading at their original EOF after the child exits.
-            # Put an exit at that byte offset; new callers jump over it and parse exit with the child command.
+            # New callers jump over that exit and transfer control to an immutable batch helper.
             padding = max(0, len(previous) - len(jump))
             content = jump.decode() + " " * padding + "@exit /b %errorlevel%\r\n:azp_start\r\n" + content
         if previous == content.encode("utf-8"):
@@ -305,7 +316,8 @@ def write_batch_shim(path, command):
 def write_text(path, content):
     tmp = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=path.parent,
+                                         prefix=".azp-", suffix=".tmp", delete=False) as handle:
             tmp = Path(handle.name)
             handle.write(content)
         deadline = time.monotonic() + 5
@@ -491,9 +503,11 @@ def cmd_keepalive(args):
         rows = [{"profile": "(registry)", "dir": str(azp_home()), "tenant": None, "users": [],
                  "subscriptions": [], "ok": False, "error": True, "detail": str(exc)}]
     failing = sorted({r["profile"] for r in rows if not r["ok"]})
+    errors = sorted({r["profile"] for r in rows if not r["ok"] and r.get("error")})
+    logins = sorted({r["profile"] for r in rows if not r["ok"] and not r.get("error")})
     stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    label = "CHECK FAILED: " if any(r.get("error") for r in rows) else "LOGIN NEEDED: "
-    summary = "all ok" if not failing else label + ", ".join(failing)
+    summary = "; ".join(label + ", ".join(names) for label, names in
+                        (("CHECK FAILED: ", errors), ("LOGIN NEEDED: ", logins)) if names) or "all ok"
     log = azp_home() / "keepalive.log"
     log_error = None
     try:
@@ -509,13 +523,16 @@ def cmd_keepalive(args):
     if not args.notify:
         print_rows(rows)
     elif failing or log_error:
-        logins = sorted({r["profile"] for r in rows if not r["ok"] and not r.get("error")})
         login_help = "Run: " + "; ".join(f"azp login {n}" for n in logins) if logins else ""
         if log_error or any(r.get("error") for r in rows):
             title = "Azure keepalive failed"
             body = (login_help + ". " if login_help else "") + "Run azp status and inspect " + str(log)
         else:
             title, body = "Azure login needed", login_help
+        if any(r.get("empty_registry") for r in rows):
+            body = "No profiles registered. Add a profile or run azp keepalive --uninstall to stop scheduled checks."
+            if log_error:
+                body += " The keepalive log could not be written."
         try:
             toast(title, body)
         except (AzpError, OSError, subprocess.TimeoutExpired) as exc:

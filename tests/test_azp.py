@@ -72,8 +72,10 @@ class AzpTest(unittest.TestCase):
         registry = json.loads((self.home / "profiles.json").read_text())
         self.assertEqual(registry["profiles"]["work"]["dir"], str(config_dir.resolve()))
         cmd_shim = (self.shims / "az-work.cmd").read_bytes()
-        self.assertIn(f'set "AZURE_CONFIG_DIR={config_dir.resolve()}"'.encode(), cmd_shim)
-        self.assertIn(f'"{sys.executable}" "{FAKE_AZ}" %* & call exit /b %%errorlevel%%\r\n'.encode(), cmd_shim)
+        self.assertIn(b".azp-shims", cmd_shim)
+        helpers = b"".join(p.read_bytes() for p in (self.shims / ".azp-shims").glob("*.cmd"))
+        self.assertIn(f'set "AZURE_CONFIG_DIR={config_dir.resolve()}"'.encode(), helpers)
+        self.assertIn(f'"{sys.executable}" "{FAKE_AZ}" %*\r\n'.encode(), helpers)
         bash_shim = (self.shims / "az-work").read_bytes()
         self.assertNotIn(b"\r", bash_shim)
         self.assertIn(str(config_dir.resolve()).replace("\\", "/").encode(), bash_shim)
@@ -223,7 +225,8 @@ class AzpTest(unittest.TestCase):
         self.make_profile("work", [])
         result = self.azp("install")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(str(AZP).encode(), (self.shims / "azp.cmd").read_bytes())
+        helpers = b"".join(p.read_bytes() for p in (self.shims / ".azp-shims").glob("*.cmd"))
+        self.assertIn(str(AZP).encode(), helpers)
         self.assertNotIn(b"\r", (self.shims / "azp").read_bytes())
         self.assertTrue((self.shims / "az-work.cmd").exists())
 
@@ -402,7 +405,8 @@ class AzpTest(unittest.TestCase):
         shim = self.shims / "azp.cmd"
         invocation = f'"{sys.executable}" -E -s "{AZP}" %*'
         for previous in (f'@{invocation}\r\n',
-                         f'@echo off\r\nsetlocal DisableDelayedExpansion\r\n{invocation}\r\n'):
+                         f'@echo off\r\nsetlocal DisableDelayedExpansion\r\n{invocation}\r\n',
+                         f'@setlocal DisableDelayedExpansion & {invocation} & call exit /b %%errorlevel%%\r\n'):
             with self.subTest(previous=previous):
                 shim.write_bytes(previous.encode())
                 for _ in range(3):
@@ -496,12 +500,15 @@ class AzpTest(unittest.TestCase):
             "azp_commands": [["add", "work", "--force", "--dir", str(new_dir)]], "exit": 7,
         }))
         shim = self.shims / "az-work.cmd"
+        original_helpers = {p: p.read_bytes() for p in (self.shims / ".azp-shims").glob("*.cmd")}
         result = subprocess.run([str(shim), "account", "show"], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)["config_dir"], str(old_dir))
         result = subprocess.run([str(shim), "account", "show"], env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(result.stdout)["config_dir"], str(new_dir))
+        for path, content in original_helpers.items():
+            self.assertEqual(path.read_bytes(), content)
 
     @unittest.skipUnless(BASH, "Bash required")
     def test_bash_shim_resolves_az_from_current_path(self):
@@ -541,6 +548,41 @@ class AzpTest(unittest.TestCase):
             self.assertIn("azp login expired", body)
             self.assertIn("azp status", body)
             self.assertNotIn("azp login bad", body)
+        summary = (self.home / "keepalive.log").read_text().splitlines()[0]
+        self.assertIn("CHECK FAILED: bad; LOGIN NEEDED: expired", summary)
+
+    @unittest.skipUnless(os.name == "nt", "Windows shell")
+    def test_cmd_launchers_preserve_quoted_arguments_and_exit_codes(self):
+        config_dir = self.make_profile("work", [])
+        self.assertEqual(self.azp("install").returncode, 0)
+        (config_dir / "fake.json").write_text(json.dumps({"exit": 7}))
+        values = ['a"b', 'a"b c', '"', 'ends"', '"starts', 'length(@)', '{"note":"a\\"b"}']
+        for launcher in ([str(self.shims / "az-work.cmd")], [str(self.shims / "azp.cmd"), "az", "work"]):
+            for value in values:
+                with self.subTest(launcher=launcher, value=value):
+                    args = ["account", "list", "--query", value]
+                    result = subprocess.run([*launcher, *args], env=self.env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["args"], args)
+
+    def test_empty_registry_notification_explains_how_to_stop_the_task(self):
+        with patch.dict(os.environ, self.env), patch("azp.toast") as notify:
+            self.assertEqual(azp.main(["keepalive", "--notify"]), 1)
+            self.assertIn("azp keepalive --uninstall", notify.call_args.args[1])
+        self.assertIn("azp keepalive --uninstall", (self.home / "keepalive.log").read_text())
+
+    def test_atomic_writes_use_identifiable_temporary_files(self):
+        destination = self.tmp / "example.cmd"
+        replace = os.replace
+        def inspect_replace(source, target):
+            self.assertEqual(source.parent, destination.parent)
+            self.assertTrue(source.name.startswith(".azp-"), source.name)
+            self.assertEqual(source.suffix, ".tmp")
+            replace(source, target)
+        with patch("azp.os.replace", side_effect=inspect_replace):
+            azp.write_text(destination, "test")
+        self.assertEqual(destination.read_text(), "test")
+        self.assertEqual(list(self.tmp.glob(".azp-*.tmp")), [])
 
 
 if __name__ == "__main__":
