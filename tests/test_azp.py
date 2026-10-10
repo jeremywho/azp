@@ -1,14 +1,22 @@
+import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 AZP = ROOT / "azp.py"
 FAKE_AZ = Path(__file__).resolve().parent / "fake_az.py"
+sys.path.insert(0, str(ROOT))
+import azp
+
+BASH = shutil.which("bash") or ("C:/Program Files/Git/bin/bash.exe" if Path("C:/Program Files/Git/bin/bash.exe").exists() else None)
 
 TENANT_A = "aaaaaaaa-0000-0000-0000-000000000000"
 TENANT_B = "bbbbbbbb-0000-0000-0000-000000000000"
@@ -21,7 +29,9 @@ def sub(name, tenant, user, default=False):
 
 class AzpTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        temporary = tempfile.TemporaryDirectory(prefix="azp-test-")
+        self.addCleanup(temporary.cleanup)
+        self.tmp = Path(temporary.name)
         self.home = self.tmp / "azp-home"
         self.shims = self.tmp / "bin"
         self.env = os.environ.copy()
@@ -210,6 +220,175 @@ class AzpTest(unittest.TestCase):
         self.assertIn(str(AZP).encode(), (self.shims / "azp.cmd").read_bytes())
         self.assertNotIn(b"\r", (self.shims / "azp").read_bytes())
         self.assertTrue((self.shims / "az-work.cmd").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows shell")
+    def test_powershell_env_keeps_quote_payload_literal(self):
+        self.env["PYTHONIOENCODING"] = "utf-8"
+        for quote in "'\u2018\u2019\u201a\u201b":
+            with self.subTest(quote=ascii(quote)):
+                config_dir = self.tmp / ("cfg" + quote + ";Write-Output AZP_INJECTED;#")
+                self.assertEqual(self.azp("add", "work", "--force", "--dir", str(config_dir)).returncode, 0)
+                assignment = self.azp("env", "work").stdout
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                     assignment + "\n[Console]::Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($env:AZURE_CONFIG_DIR)))"],
+                    env=self.env, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, base64.b64encode(str(config_dir).encode()).decode())
+
+    @unittest.skipUnless(BASH, "Bash required")
+    def test_bash_env_and_shim_keep_quote_payload_literal(self):
+        config_dir = self.tmp / "cfg'; echo AZP_INJECTED; #"
+        self.assertEqual(self.azp("add", "work", "--dir", str(config_dir)).returncode, 0)
+        assignment = self.azp("env", "work", "--shell", "bash").stdout
+        result = subprocess.run(
+            [BASH, "-c", assignment + '\nprintf "%s" "$AZURE_CONFIG_DIR"'],
+            env=self.env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(config_dir).replace("\\", "/"))
+        result = subprocess.run([BASH, str(self.shims / "az-work"), "account", "show"],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["config_dir"], str(config_dir))
+
+    @unittest.skipUnless(os.name == "nt", "Windows shell")
+    def test_cmd_shim_keeps_percent_and_bang_paths_literal(self):
+        config_dir = self.tmp / "cfg-%AZP_TEST_MARKER%-!AZP_TEST_MARKER! & (x)"
+        self.env["AZP_TEST_MARKER"] = "EXPANDED"
+        self.assertEqual(self.azp("add", "work", "--dir", str(config_dir)).returncode, 0)
+        result = subprocess.run([str(self.shims / "az-work.cmd"), "account", "show"],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["config_dir"], str(config_dir))
+        result = self.azp("env", "work", "--shell", "cmd")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("use azp run", result.stderr)
+
+    @unittest.skipUnless(os.name == "nt" and BASH, "Windows and Git Bash")
+    def test_installation_path_is_escaped_in_both_launchers(self):
+        directory = self.tmp / "O'Brien-%AZP_TEST_MARKER%-!test!"
+        directory.mkdir()
+        script = directory / "azp.py"
+        shutil.copyfile(AZP, script)
+        result = subprocess.run([sys.executable, str(script), "install"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env["AZP_TEST_MARKER"] = "EXPANDED"
+        for command in ([str(self.shims / "azp.cmd"), "list", "--json"],
+                        [BASH, str(self.shims / "azp"), "list", "--json"]):
+            result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {})
+
+    def test_status_checks_each_identity_in_same_and_different_tenants(self):
+        config_dir = self.make_profile("mixed", [
+            sub("Alice", TENANT_A, "alice@example.test", True),
+            sub("Bob", TENANT_A, "bob@example.test"),
+            sub("BobOther", TENANT_B, "bob@example.test"),
+        ])
+        (config_dir / "fake.json").write_text(json.dumps({"identity_tokens": {
+            "alice@example.test|" + TENANT_A: "2026-10-10 12:00:00",
+            "bob@example.test|" + TENANT_A: "AADSTS700082: expired",
+            "bob@example.test|" + TENANT_B: "2026-10-10 12:00:00",
+        }}))
+        result = self.azp("status", "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual({(r["users"][0], r["tenant"]): r["ok"] for r in rows}, {
+            ("alice@example.test", TENANT_A): True,
+            ("bob@example.test", TENANT_A): False,
+            ("bob@example.test", TENANT_B): True,
+        })
+
+    def test_concurrent_writers_preserve_registry_and_shims(self):
+        def add(i):
+            return self.azp("add", f"p{i}", "--dir", str(self.tmp / f"cfg-{i}"))
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(add, range(12)))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(json.loads(self.azp("list", "--json").stdout)), {f"p{i}" for i in range(12)})
+        commands = [("remove", f"p{i}") for i in range(0, 12, 2)]
+        commands += [("add", f"p{i}", "--dir", str(self.tmp / f"cfg-{i}")) for i in range(12, 18)]
+        commands += [("install",)]
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(lambda args: self.azp(*args), commands))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        expected = {f"p{i}" for i in [*range(1, 12, 2), *range(12, 18)]}
+        self.assertEqual(set(json.loads(self.azp("list", "--json").stdout)), expected)
+        self.assertEqual({p.stem[3:] for p in self.shims.glob("az-*.cmd")}, expected)
+        self.assertEqual({p.name[3:] for p in self.shims.glob("az-*") if p.suffix != ".cmd"}, expected)
+
+    def test_keepalive_continues_after_bad_profile_and_notifies(self):
+        bad = self.make_profile("bad", [])
+        self.make_profile("good", [sub("Good", TENANT_A, "good@example.test", True)],
+                          tokens={TENANT_A: "2026-10-10 12:00:00"})
+        for content in ("{", "[]", '{"subscriptions": [{}]}'):
+            with self.subTest(content=content):
+                (bad / "azureProfile.json").write_text(content)
+                with patch.dict(os.environ, self.env), patch("azp.toast") as notify:
+                    self.assertEqual(azp.main(["keepalive", "--notify"]), 1)
+                    notify.assert_called_once()
+                    self.assertEqual(notify.call_args.args[0], "Azure keepalive failed")
+                log = (self.home / "keepalive.log").read_text()
+                self.assertIn("bad None FAIL", log)
+                self.assertIn(f"good {TENANT_A} ok", log)
+
+    def test_missing_executable_is_logged_and_notified(self):
+        self.make_profile("work", [sub("Prod", TENANT_A, "me@example.test", True)])
+        self.env["AZP_AZ_CMD"] = json.dumps([str(self.tmp / "missing.exe")])
+        with patch.dict(os.environ, self.env), patch("azp.toast") as notify:
+            self.assertEqual(azp.main(["keepalive", "--notify"]), 1)
+            notify.assert_called_once()
+        self.assertIn("FAIL", (self.home / "keepalive.log").read_text())
+
+    def test_invalid_registry_is_logged_and_notified(self):
+        self.home.mkdir()
+        for content in ("{", "[]", '{"profiles": {"bad": {}}}'):
+            with self.subTest(content=content):
+                (self.home / "profiles.json").write_text(content)
+                with patch.dict(os.environ, self.env), patch("azp.toast") as notify:
+                    self.assertEqual(azp.main(["keepalive", "--notify"]), 1)
+                    notify.assert_called_once()
+        self.assertIn("(registry) None FAIL", (self.home / "keepalive.log").read_text())
+
+    def test_log_failure_still_notifies(self):
+        self.make_profile("work", [sub("Prod", TENANT_A, "me@example.test", True)],
+                          tokens={TENANT_A: "2026-10-10 12:00:00"})
+        (self.home / "keepalive.log").mkdir()
+        with patch.dict(os.environ, self.env), patch("azp.toast") as notify:
+            self.assertEqual(azp.main(["keepalive", "--notify"]), 1)
+            notify.assert_called_once()
+
+    def test_notification_failure_is_logged(self):
+        self.make_profile("work", [])
+        with patch.dict(os.environ, self.env), patch("azp.toast", side_effect=OSError("notification unavailable")):
+            self.assertEqual(azp.main(["keepalive", "--notify"]), 1)
+        self.assertIn("notification failed: notification unavailable", (self.home / "keepalive.log").read_text())
+
+    def test_scheduled_action_pins_home_and_runs_without_installing_environment(self):
+        self.make_profile("work", [sub("Prod", TENANT_A, "me@example.test", True)],
+                          tokens={TENANT_A: "2026-10-10 12:00:00"})
+        with patch.dict(os.environ, self.env), patch("azp.shutil.which", return_value="C:/Python/pyw.exe"), patch("azp.subprocess.run") as run:
+            azp.install_task(6)
+        command = run.call_args.args[0]
+        action = command[command.index("/TR") + 1]
+        expected = subprocess.list2cmdline(["C:/Python/pyw.exe", "-3", "-E", "-s", str(AZP),
+                                           "--home", str(self.home), "keepalive", "--notify"])
+        self.assertEqual(action, expected)
+        self.env["AZP_HOME"] = str(self.tmp / "wrong-home")
+        result = self.azp("--home", str(self.home), "keepalive", "--notify")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("all ok", (self.home / "keepalive.log").read_text())
+        self.assertFalse((self.tmp / "wrong-home").exists())
+
+    def test_empty_registry_is_not_reported_as_healthy(self):
+        result = self.azp("status", "--json")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no profiles registered", result.stdout)
 
 
 if __name__ == "__main__":
