@@ -151,6 +151,72 @@ class AzpTest(unittest.TestCase):
         seen = json.loads(result.stdout)
         self.assertEqual(seen["args"], ["login", "--tenant", TENANT_C, "--use-device-code", "--allow-no-subscriptions"])
 
+    def test_login_tenant_flag_replaces_registered_tenant(self):
+        self.make_profile("work", [], tenant=TENANT_C)
+        result = self.azp("login", "work", "--tenant", TENANT_A, "--allow-no-subscriptions")
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_A, "--allow-no-subscriptions"])
+        result = self.azp("login", "work", f"--tenant={TENANT_B}")
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_B])
+
+    def test_login_tenant_flag_works_without_registered_tenant(self):
+        self.make_profile("home", [])
+        result = self.azp("login", "home", "--tenant", TENANT_A)
+        self.assertEqual(json.loads(result.stdout)["args"], ["login", "--tenant", TENANT_A])
+
+    def helper_names(self):
+        return {p.name for p in (self.shims / ".azp-shims").glob("*.cmd")}
+
+    def referenced_helper(self, shim):
+        return azp.HELPER_REF_RE.search((self.shims / shim).read_text(encoding="utf-8")).group(1)
+
+    def age_orphan_markers(self, seconds):
+        for marker in (self.shims / ".azp-shims").glob("*.orphan"):
+            past = marker.stat().st_mtime - seconds
+            os.utime(marker, (past, past))
+
+    def test_removed_profile_helper_is_marked_then_deleted_after_grace(self):
+        self.make_profile("home", [])
+        self.make_profile("work", [])
+        home_helper = self.referenced_helper("az-home.cmd")
+        work_helper = self.referenced_helper("az-work.cmd")
+        self.assertEqual(self.azp("remove", "work").returncode, 0)
+        helpers = self.shims / ".azp-shims"
+        self.assertIn(work_helper, self.helper_names())
+        self.assertTrue((helpers / work_helper).with_suffix(".orphan").exists())
+        self.assertFalse((helpers / home_helper).with_suffix(".orphan").exists())
+
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertIn(work_helper, self.helper_names())
+
+        self.age_orphan_markers(azp.HELPER_GRACE_S + 60)
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertNotIn(work_helper, self.helper_names())
+        self.assertFalse((helpers / work_helper).with_suffix(".orphan").exists())
+        self.assertIn(home_helper, self.helper_names())
+
+    def test_orphan_that_is_referenced_again_is_kept(self):
+        config_dir = self.make_profile("work", [])
+        helper = self.referenced_helper("az-work.cmd")
+        self.assertEqual(self.azp("remove", "work").returncode, 0)
+        self.age_orphan_markers(azp.HELPER_GRACE_S + 60)
+        self.assertEqual(self.azp("add", "work", "--dir", str(config_dir)).returncode, 0)
+        self.assertEqual(self.referenced_helper("az-work.cmd"), helper)
+        self.assertIn(helper, self.helper_names())
+        self.assertFalse((self.shims / ".azp-shims" / helper).with_suffix(".orphan").exists())
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertIn(helper, self.helper_names())
+
+    def test_retargeted_profile_old_helper_survives_grace_period(self):
+        self.make_profile("work", [])
+        old_helper = self.referenced_helper("az-work.cmd")
+        new_dir = self.tmp / "new-dir"
+        self.assertEqual(self.azp("add", "work", "--force", "--dir", str(new_dir)).returncode, 0)
+        self.assertNotEqual(self.referenced_helper("az-work.cmd"), old_helper)
+        self.assertIn(old_helper, self.helper_names())
+        self.age_orphan_markers(azp.HELPER_GRACE_S - 3600)
+        self.assertEqual(self.azp("install").returncode, 0)
+        self.assertIn(old_helper, self.helper_names())
+
     def test_cmd_shim_passes_unquoted_parentheses_through(self):
         config_dir = self.make_profile("work", [])
         args = ["account", "list", "--query", "length(@)", "-o", "tsv"]

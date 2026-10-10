@@ -31,13 +31,15 @@ Manual install: `git clone https://github.com/jeremywho/azp && py -3 azp/azp.py 
 | Command | Does |
 |---|---|
 | `azp add <name> [--tenant ID] [--dir D]` | Register a profile (dir defaults to `~/.azure-<name>`) and create its `az-<name>` command |
-| `azp login <name> [--device-code]` | `az login` into that profile; extra args pass through |
+| `azp login <name> [--device-code] [--tenant ID]` | `az login` into that profile; `--tenant` replaces the registered tenant for this login; extra args pass through |
 | `az-<name> ...` / `azp az <name> ...` | Run `az` as that account |
 | `azp run <name> -- <cmd>` | Run any command (e.g. an SDK script using `AzureCliCredential`) as that account |
 | `azp env <name> [--shell bash\|cmd]` | Print the line that points the current shell at a profile (`azp env work \| iex`) |
 | `azp which <subscription>` | Find which account owns a subscription |
 | `azp status` / `azp list` | Token health per account and tenant (exit 1 if any need login) / offline listing |
 | `azp keepalive --install` | Refresh every account every 6 h; toast on failure |
+
+One account, several tenants: a single profile already holds every tenant its account can reach, and status/keepalive check each one. Target a tenant per command with `az-<name> ... --subscription <name or id>` rather than `az account set`, which changes that profile's default for every terminal using it. To add a tenant the plain login skipped (one with no subscriptions, or one that demands its own MFA), run `azp login <name> --tenant <id> --allow-no-subscriptions`; az adds it alongside the profile's existing tenants. For a separate default subscription per tenant, register a second profile: `azp add <name>-<tenant> --tenant <id>`.
 
 Limit: tenants that enforce a Conditional Access sign-in frequency or fresh MFA (`AADSTS50078`) still need `azp login <name>` on their schedule. The keepalive turns that into a toast instead of a mid-task failure.
 
@@ -49,7 +51,7 @@ A fresh Azure config containing only installation metadata is reported as not lo
 
 Generated shims and PowerShell/Bash environment output escape literal paths. `azp env --shell cmd` rejects paths containing percent signs, exclamation marks, or other characters that cmd cannot safely preserve in an assignment; use `azp run` or `azp az` for those paths. The generated `.cmd` shims support percent signs and exclamation marks in paths. Bash profile shims find `az` on the current PATH, so moving the Azure CLI does not require regenerating them.
 
-Windows launchers keep versioned batch helpers in `.azp-shims` inside the shim directory. Updates retain older helpers so running commands can finish without reading rewritten batch code. No launcher control commands are appended to forwarded arguments. Interrupted file writes may leave identifiable `.azp-*.tmp` files.
+Windows launchers keep versioned batch helpers in `.azp-shims` inside the shim directory. Updates retain older helpers so running commands can finish without reading rewritten batch code; `add`, `remove` and `install` mark helpers no shim references and delete them once they have been unreferenced for 24 hours. No launcher control commands are appended to forwarded arguments. Interrupted file writes may leave identifiable `.azp-*.tmp` files.
 
 After upgrading, run `azp install` to regenerate existing shims, then `azp keepalive --install` to update the scheduled action. Profile registrations and Azure credential caches are kept in place.
 

@@ -18,6 +18,8 @@ from uuid import UUID
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 TASK_NAME = "azp-keepalive"
 CHECK_TIMEOUT_S = 90
+HELPER_GRACE_S = 24 * 3600
+HELPER_REF_RE = re.compile(r"\.azp-shims[\\/]([0-9a-f]{64}\.cmd)", re.IGNORECASE)
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
@@ -313,6 +315,33 @@ def write_batch_shim(path, command):
     write_text(path, content)
 
 
+def collect_helpers():
+    helpers = shim_dir() / ".azp-shims"
+    if not helpers.is_dir():
+        return
+    try:
+        referenced = set()
+        for shim in shim_dir().glob("*.cmd"):
+            referenced.update(m.lower() for m in HELPER_REF_RE.findall(shim.read_text(encoding="utf-8", errors="replace")))
+        now = time.time()
+        for helper in helpers.glob("*.cmd"):
+            marker = helper.with_suffix(".orphan")
+            if helper.name.lower() in referenced:
+                marker.unlink(missing_ok=True)
+            elif not marker.exists():
+                marker.touch()
+            # cmd.exe re-reads a running batch file by path after its child exits, so a helper replaced
+            # mid-run must outlive any command still executing it.
+            elif now - marker.stat().st_mtime >= HELPER_GRACE_S:
+                helper.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+        for marker in helpers.glob("*.orphan"):
+            if not marker.with_suffix(".cmd").exists():
+                marker.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"azp: could not clean up unused shim helpers: {exc}", file=sys.stderr)
+
+
 def write_text(path, content):
     tmp = None
     try:
@@ -380,6 +409,7 @@ def cmd_add(args):
         profiles[args.name]["tenant"] = args.tenant
     save_registry(profiles)
     write_shims(profiles)
+    collect_helpers()
     print(f"added '{args.name}' -> {config_dir}")
     if not read_subscriptions(config_dir):
         print(f"next: azp login {args.name}")
@@ -394,6 +424,7 @@ def cmd_remove(args):
     prof = profiles.pop(args.name)
     save_registry(profiles)
     remove_shims(args.name)
+    collect_helpers()
     config_dir = prof.get("dir", "unknown") if isinstance(prof, dict) else "unknown"
     print(f"removed '{args.name}' (config dir left in place: {config_dir})")
     return 0
@@ -431,8 +462,9 @@ def cmd_login(args):
     prof = get_profile(load_registry(), args.name)
     Path(prof["dir"]).mkdir(parents=True, exist_ok=True)
     cmd = az_cmd() + ["login"]
-    if prof.get("tenant"):
-        cmd += ["--tenant", prof["tenant"]]
+    tenant = args.tenant or prof.get("tenant")
+    if tenant:
+        cmd += ["--tenant", tenant]
     if args.device_code:
         cmd += ["--use-device-code"]
     cmd += args.extra
@@ -593,6 +625,7 @@ def cmd_install(args):
     posix = lambda p: str(p).replace("\\", "/")
     write_text(target / "azp", f"#!/usr/bin/env bash\nexec {bash_quote(posix(exe))} {flags} {bash_quote(posix(script))} \"$@\"\n")
     write_shims(load_registry())
+    collect_helpers()
     print(f"shims written to {target}")
     return 0
 
@@ -624,6 +657,7 @@ def build_parser():
     p = sub.add_parser("login", help="az login into a profile's config dir; other args go to az login")
     p.add_argument("name")
     p.add_argument("--device-code", action="store_true")
+    p.add_argument("--tenant", help="tenant to log in to instead of the registered one; it is added alongside the profile's existing tenants")
     p.set_defaults(func=cmd_login, passthrough=True)
 
     p = sub.add_parser("az", help="run az as a profile: azp az <profile> <az args...>")
